@@ -1,15 +1,66 @@
 import frappe
+import requests
 from frappe import _
 from frappe.model.document import get_controller
 from frappe.utils import get_user_info_for_avatar, now_datetime
 from frappe.utils.caching import redis_cache
 from pypika import Criterion, Order
+from frappe.utils.data import format_datetime
 
 from helpdesk.consts import DEFAULT_TICKET_TEMPLATE
 from helpdesk.helpdesk.doctype.hd_form_script.hd_form_script import get_form_script
 from helpdesk.helpdesk.doctype.hd_ticket_template.api import get_fields_meta
 from helpdesk.helpdesk.doctype.hd_ticket_template.api import get_one as get_template
 from helpdesk.utils import agent_only, check_permissions, get_customer, is_agent
+
+
+@frappe.whitelist()
+def get_personal_infos():
+    return {
+        "full_name": "Md Shams Wadud",
+        "date_of_birth": "9th Septembar, 1990",
+        "nid_no": "9119015049",
+        "father_name": "Md Abdul Wadud",
+        "mother_name": "Shirin Begum",
+        "address": "Daulatpur, Khulna",
+        "present_address": "Azimpur, Dhaka"
+    }
+
+@frappe.whitelist()
+def get_transaction_infos(transactionId:str):
+    url = f"https://api.p-pay.dev-polygontech.xyz/api/v1/support/transaction/{transactionId}"
+    headers = {
+        "x-api-key": "secret"
+    }
+
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+    except requests.exceptions.RequestException as e:
+        frappe.throw(_("Failed to fetch transaction data: ") + str(e))
+
+    transactions = data.get("transactions", [])
+    mapped = []
+
+    for tx in transactions:
+        time = format_datetime(tx.get("createdat"), "d MMM yyyy, HH:mm") if tx.get("createdat") else "N/A"
+        tx_type = tx.get("transactiontype", {}).get("name", "")
+        from_account = tx.get("fromaccount", {}).get("name", "")
+        to_account = tx.get("toaccount", {}).get("name", "")
+        amount = str(tx.get("amount", ""))
+        description = f"{tx_type}: From {from_account} to {to_account}"
+
+        mapped.append({
+            "time": time,
+            "type": tx_type,
+            "from": from_account,
+            "to": to_account,
+            "description": description,
+            "amount": amount
+        })
+
+    return mapped
 
 
 @frappe.whitelist()
