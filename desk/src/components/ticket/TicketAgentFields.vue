@@ -20,7 +20,7 @@
                                 href="#"
                                 style="margin-left: 10px;"
                                 class="overflow-hidden text-ellipsis whitespace-nowrap text-base leading-5 underline"
-                                @click.prevent="openPhoneModal"
+                                @click.prevent="() => openPersonalInfoModal(ticket[field.fieldname])"
                                 >
                                 {{ ticket[field.fieldname] }}
                             </a>
@@ -96,7 +96,7 @@
         @change="(data) => update(data.fieldname, data.value)"
       />
     </div>
-    <PhoneNumberModal v-model="showPhoneModal" :info="phoneInfo" />
+    <PersonalInfoModal v-model="showPersonalInfoModal" :info="personalInfo" />
     <TransactionInfoModal v-model="showTransactionModal" :records="transactionRecords" />
   </div>
 </template>
@@ -105,7 +105,7 @@
 import { computed, ref } from "vue";
 import { toast, call } from "frappe-ui";
 import UniInput2 from "../UniInput2.vue";
-import PhoneNumberModal from "./PhoneNumberModal.vue";
+import PersonalInfoModal from "./PersonalInfoModal.vue";
 import TransactionInfoModal from "./TransactionInfoModal.vue";
 
 const emit = defineEmits(["update"]);
@@ -123,14 +123,17 @@ function update(field, value, event = null) {
 }
 
 // Phone number wise data gathering
-const showPhoneModal = ref(false);
-const phoneInfo = ref({});
+const showPersonalInfoModal = ref(false);
+const personalInfo = ref({});
 
-async function openPhoneModal() {
+async function openPersonalInfoModal(phoneNo: string) {
   try {
-    const data = await call("helpdesk.helpdesk.doctype.hd_ticket.api.get_personal_infos");
-    phoneInfo.value = data;
-    showPhoneModal.value = true;
+    const data = await call(
+      "helpdesk.helpdesk.doctype.hd_ticket.api.get_personal_infos",
+      { "phone_no" : phoneNo }
+    );
+    personalInfo.value = data;
+    showPersonalInfoModal.value = true;
   } catch (err) {
     toast.error("Failed to load personal info.");
   }

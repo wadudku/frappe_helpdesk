@@ -26,6 +26,37 @@ def get_personal_infos():
         "present_address": "Azimpur, Dhaka"
     }
 
+
+
+@frappe.whitelist()
+def get_personal_infos(phone_no:str):
+    url = f"https://api.p-pay.dev-polygontech.xyz/api/v1/support/account/{phone_no}"
+    headers = {
+        "x-api-key": "secret"
+    }
+
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+    except requests.exceptions.RequestException as e:
+        frappe.throw(_("Failed to fetch personal data: ") + str(e))
+
+    personal_record = {
+        "full_name": data.get("fullname", ""),
+        "date_of_birth": str(data.get("dob", "")),
+        "nid_no": str(data.get("nidNumber", "")),
+        "father_name": data.get("fatherName", ""),
+        "mother_name": data.get("motherName", ""),
+        "address": data.get("nidAddress", ""),
+        "present_address": data.get("pressentAddress", ""),
+        "nid_front": data.get("nidfront", ""),
+        "nid_back": data.get("nidback", ""),
+        "profile_image": data.get("profileimage", ""),
+    }
+
+    return personal_record
+
 @frappe.whitelist()
 def get_transaction_infos(transactionId:str):
     url = f"https://api.p-pay.dev-polygontech.xyz/api/v1/support/transaction/{transactionId}"
