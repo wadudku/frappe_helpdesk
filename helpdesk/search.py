@@ -1,4 +1,4 @@
-# Copyright (c) 2023, Frappe Technologies Pvt. Ltd. and Contributors
+# Copyright (c) 2023, Frappe Technologies Pvt. Ltd.
 # MIT License. See license.txt
 
 from __future__ import unicode_literals
@@ -15,10 +15,22 @@ from bs4 import BeautifulSoup, PageElement
 from frappe.utils import cstr, strip_html_tags, update_progress_bar
 from frappe.utils.caching import redis_cache
 from frappe.utils.synchronization import filelock
-from redis.commands.search.field import TagField, TextField
-from redis.commands.search.indexDefinition import IndexDefinition
-from redis.commands.search.query import Query
-from redis.exceptions import ResponseError
+
+# ---- Redis / RediSearch imports: support both redis-py 4.x (camel) and 5.x (snake) ----
+try:
+    from redis.commands.search.field import TagField, TextField
+    try:
+        # redis-py 4.x
+        from redis.commands.search.indexDefinition import IndexDefinition
+    except ImportError:
+        # redis-py 5.x
+        from redis.commands.search.index_definition import IndexDefinition
+    from redis.commands.search.query import Query
+    from redis.exceptions import ResponseError
+except Exception:
+    # Fallback to legacy redisearch client if present (optional)
+    from redisearch import TagField, TextField, IndexDefinition, Query  # type: ignore
+    from redis import ResponseError  # type: ignore
 
 from helpdesk.utils import is_agent
 
@@ -28,51 +40,10 @@ if TYPE_CHECKING:
 NUM_RESULTS = 5
 
 STOPWORDS = [
-    "a",
-    "is",
-    "the",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "but",
-    "by",
-    "for",
-    "if",
-    "in",
-    "into",
-    "it",
-    "no",
-    "not",
-    "of",
-    "on",
-    "or",
-    "such",
-    "that",
-    "their",
-    "then",
-    "there",
-    "these",
-    "they",
-    "this",
-    "to",
-    "was",
-    "will",
-    "with",
-    "how",
-    "what",
-    "where",
-    "when",
-    "i",
-    "you",
-    "me",
-    "do",
-    "has",
-    "been",
-    "urgent",
-    "want",
+    "a", "is", "the", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if",
+    "in", "into", "it", "no", "not", "of", "on", "or", "such", "that", "their", "then",
+    "there", "these", "they", "this", "to", "was", "will", "with", "how", "what",
+    "where", "when", "i", "you", "me", "do", "has", "been", "urgent", "want",
 ]
 
 
@@ -96,21 +67,14 @@ class Search:
         self.redis = frappe.cache()
         self.index_name = index_name
         self.prefix = prefix
-        self.schema = []
-        for field in schema:
-            self.schema.append(frappe._dict(field))
+        self.schema = [frappe._dict(field) for field in schema]
+        self._index_exists = None  # lazy-evaluated
 
     def create_index(self):
-        index_def = IndexDefinition(
-            prefix=[f"{self.redis.make_key(self.prefix).decode()}:"],
-        )
+        index_def = IndexDefinition(prefix=[f"{self.redis.make_key(self.prefix).decode()}:" ])
         schema = []
         for field in self.schema:
-            kwargs = {
-                k: v
-                for k, v in field.items()
-                if k in ["weight", "sortable", "no_index", "no_stem"]
-            }
+            kwargs = {k: v for k, v in field.items() if k in ["weight", "sortable", "no_index", "no_stem"]}
             if field.type == "tag":
                 schema.append(TagField(field.name, **kwargs))
             else:
@@ -122,22 +86,18 @@ class Search:
             stopwords=get_stopwords(),
         )
         self.add_synonyms()
-
         self._index_exists = True
 
     def add_synonyms(self):
-        for word, synonym in frappe.get_all(
-            "HD Synonym", ["parent", "name"], as_list=True
-        ):
+        # Note: using the word as the synonym group id; adjust if you want numeric groups.
+        for word, synonym in frappe.get_all("HD Synonym", ["parent", "name"], as_list=True):
+            # synupdate(groupid, skipinitialscan, *terms)
             self.redis.ft(self.index_name).synupdate(word, True, word, synonym)
 
     def add_document(self, id, doc):
         doc = frappe._dict(doc)
         doc_id = self.redis.make_key(f"{self.prefix}:{id}").decode()
-        mapping = {}
-        for field in self.schema:
-            if field.name in doc:
-                mapping[field.name] = cstr(doc[field.name])
+        mapping = {field.name: cstr(doc[field.name]) for field in self.schema if field.name in doc}
         if self.index_exists():
             self.redis.ft(self.index_name).add_document(doc_id, replace=True, **mapping)
 
@@ -146,31 +106,36 @@ class Search:
         if self.index_exists():
             self.redis.ft(self.index_name).delete_document(key)
 
-    def search(
-        self,
-        query,
-        start=0,
-        page_length=NUM_RESULTS,
-        highlight=False,
-    ):
+    def search(self, query, start=0, page_length=NUM_RESULTS, highlight=False):
         query = self.clean_query(query)
-        query = Query(query).paging(start, page_length)
+        q = Query(query).paging(start, page_length)
         if highlight:
-            query = query.highlight()
+            q = q.highlight()
 
-        query.summarize(fields=["description"])
-        query.scorer("DISMAX")
-        query.with_scores()
-        query.dialect(None)
+        q.summarize(fields=["description"])
+        q.scorer("DISMAX")
 
-        result = self.redis.ft(self.index_name).search(query)
+        # Avoid passing None (redis-py expects int dialect, default is fine)
+        try:
+            q.dialect(2)
+        except Exception:
+            pass
 
-        out = frappe._dict(docs=[], total=result.total, duration=result.duration)
+        try:
+            result = self.redis.ft(self.index_name).search(q)
+        except ResponseError:
+            # likely index missing: try once to create
+            self.create_index()
+            result = self.redis.ft(self.index_name).search(q)
+
+        # duration may not exist on all client versions
+        duration = getattr(result, "duration", None) or getattr(result, "execution_time", None)
+        out = frappe._dict(docs=[], total=result.total, duration=duration)
         for doc in result.docs:
             id = doc.id.split(":", 1)[1]
             _doc = frappe._dict(doc.__dict__)
             _doc.id = id
-            _doc.payload = json.loads(doc.payload) if doc.payload else None
+            _doc.payload = json.loads(doc.payload) if getattr(doc, "payload", None) else None
             out.docs.append(_doc)
         return out
 
@@ -190,18 +155,15 @@ class Search:
         raise NotImplementedError
 
     def num_records(self) -> int:
-        num = 0
-        for doctype in self.DOCTYPE_FIELDS.keys():
-            num += self.get_count(doctype)
-        return num
+        return sum(self.get_count(doctype) for doctype in self.DOCTYPE_FIELDS.keys())
 
     def index_exists(self):
-        if hasattr(self, "_index_exists"):
+        if self._index_exists is not None:
             return self._index_exists
         self._index_exists = False
         with suppress(ResponseError):
             ftinfo = self.redis.ft(self.index_name).info()
-            if isclose(int(ftinfo["num_docs"]), self.num_records(), rel_tol=0.1):
+            if isclose(int(ftinfo.get("num_docs", 0)), self.num_records(), rel_tol=0.1):
                 self._index_exists = True
         return self._index_exists
 
@@ -209,20 +171,10 @@ class Search:
 class HelpdeskSearch(Search):
     DOCTYPE_FIELDS = {
         "HD Ticket": [
-            "name",
-            "subject",
-            "description",
-            "agent_group",
-            "modified",
-            "creation",
+            "name", "subject", "description", "agent_group", "modified", "creation",
         ],
         "HD Article": [
-            "name",
-            "category",
-            "title",
-            "content",
-            "modified",
-            "creation",
+            "name", "title", "content", "modified", "creation",
             "category.category_name as category",
         ],
     }
@@ -245,7 +197,7 @@ class HelpdeskSearch(Search):
         self.create_index()
         records = self.get_records("HD Ticket") + self.get_records("HD Article")
         total = len(records)
-        for i, doc in enumerate(records):
+        for i, doc in enumerate(records, start=1):
             self.index_doc(doc)
             if not hasattr(frappe.local, "request"):
                 update_progress_bar("Indexing", i, total)
@@ -260,8 +212,9 @@ class HelpdeskSearch(Search):
                 "subject": doc.subject,
                 "team": doc.agent_group,
                 "modified": doc.modified,
+                # (optional) add description/headings here if you want to search inside ticket body
             }
-        if doc.doctype == "HD Article":
+        elif doc.doctype == "HD Article":
             fields = {
                 "doctype": doc.doctype,
                 "name": doc.name,
@@ -318,13 +271,12 @@ class HelpdeskSearch(Search):
             return frappe.db.count(doctype)
         if doctype == "HD Article":
             return len(self.get_records(doctype))
+        return 0
 
     def get_records(self, doctype):
         records = []
         filters = {"status": "Published"} if doctype == "HD Article" else {}
-        for d in frappe.db.get_all(
-            doctype, filters=filters, fields=self.DOCTYPE_FIELDS[doctype]
-        ):
+        for d in frappe.db.get_all(doctype, filters=filters, fields=self.DOCTYPE_FIELDS[doctype]):
             d.doctype = doctype
             if doctype == "HD Article":
                 for heading, section in self.get_sections(d.content):
@@ -333,7 +285,7 @@ class HelpdeskSearch(Search):
                     cd.content = section
                     cd.headings = heading
                     records.append(cd)
-            elif doctype == "HD Ticket":
+            else:  # HD Ticket
                 d.headings = self.extract_headings(d.description)
                 records.append(d)
         return records
@@ -341,46 +293,44 @@ class HelpdeskSearch(Search):
 
 @frappe.whitelist()
 def search(query, only_articles=False) -> list[dict[str, list[dict]]]:
-    search = HelpdeskSearch()
-    query = search.clean_query(query)
+    s = HelpdeskSearch()
+    query = s.clean_query(query)
     query_parts = query.split()
-    query = ""
+    q = ""
     for part in query_parts:
         if part in get_synonym_words():
-            query += f" {part}"
+            q += f" {part}"
             continue
         if part in get_stopwords():
             continue
         if len(part) > 3:
-            query += f" %{part}%"
+            q += f" %{part}%"
         else:
-            query += f" {part}*"
+            q += f" {part}*"
 
-    result = search.search(query, start=0, highlight=True)
-    groups = {}
+    result = s.search(q, start=0, highlight=True)
+    groups: dict[str, list] = {}
     for r in result.docs:
         doctype, name = r.id.split(":")
         r.doctype = doctype
         r.name = name
         if doctype == "HD Ticket" and not only_articles:
+            # FIX: don't append an empty list for non-agents; just skip
             if not is_agent():
-                r = []
+                continue
             groups.setdefault("Tickets", []).append(r)
-        if doctype == "HD Article":
+        elif doctype == "HD Article":
             groups.setdefault("Articles", []).append(r)
 
-    out = []
-    for key in groups:
-        out.append({"title": key, "items": groups[key]})
-    return out
+    return [{"title": k, "items": v} for k, v in groups.items()]
 
 
 @frappe.whitelist()
 @filelock("helpdesk_search_indexing", timeout=1)
 def build_index():
     frappe.cache().set_value("helpdesk_search_indexing_in_progress", True)
-    search = HelpdeskSearch()
-    search.build_index()
+    s = HelpdeskSearch()
+    s.build_index()
     frappe.cache().set_value("helpdesk_search_indexing_in_progress", False)
 
 
@@ -390,8 +340,8 @@ def build_index_in_background():
 
 
 def build_index_if_not_exists():
-    search = HelpdeskSearch()
-    if not search.index_exists():
+    s = HelpdeskSearch()
+    if not s.index_exists():
         build_index()
 
 
